@@ -39,6 +39,37 @@ const missingSymbolCache = new LRU<string, boolean>({
   max: 10000,
 });
 
+type RequestLogContext = {
+  requestId: string;
+  method: string;
+  originalUrl: string;
+  convertedPath?: string;
+  outcome?: string;
+};
+
+const requestContext = new WeakMap<http.IncomingMessage, RequestLogContext>();
+
+function logServerStart(): void {
+  console.log('[symbol-server] starting with', {
+    port: process.env.PORT || 8080,
+    targetHost: TARGET_HOST,
+    pathPrefix: PATH_PREFIX || '',
+    targetUrl: TARGET_URL,
+  });
+}
+
+function logRequestLifecycle(context: RequestLogContext, res: http.ServerResponse): void {
+  console.log('[symbol-server] response', {
+    requestId: context.requestId,
+    method: context.method,
+    originalUrl: context.originalUrl,
+    convertedPath: context.convertedPath,
+    outcome: context.outcome || 'proxy',
+    statusCode: res.statusCode,
+    location: res.getHeader('Location') || undefined,
+  });
+}
+
 function incomingPathToProxyPath(path: string): string {
   // symstore.exe and symsrv.dll don't always agree on the case of the path to a
   // given symbol file. Since our artifact URLs are case-sensitive, this causes symbol
@@ -62,7 +93,24 @@ function incomingPathToProxyPath(path: string): string {
 }
 
 proxy.on('proxyReq', (proxyReq, request, response, options) => {
-  proxyReq.path = incomingPathToProxyPath(proxyReq.path);
+  const convertedPath = incomingPathToProxyPath(proxyReq.path);
+  const context = requestContext.get(request);
+
+  if (context) {
+    context.convertedPath = convertedPath;
+    context.outcome = 'proxy';
+  }
+
+  console.log('[symbol-server] proxy request', {
+    requestId: context?.requestId,
+    method: request.method,
+    originalUrl: request.url,
+    originalProxyPath: proxyReq.path,
+    convertedPath,
+    targetHost: TARGET_HOST,
+  });
+
+  proxyReq.path = convertedPath;
 
   // AZ CDN determines the bucket from the Host header
   proxyReq.setHeader('Host', TARGET_HOST);
@@ -77,9 +125,15 @@ proxy.on('proxyReq', (proxyReq, request, response, options) => {
   response.writeHead = (...args: [number, any]) => {
     if (args[0] == 403) {
       missingSymbolCache.set(proxyReq.path, true);
+      if (context) {
+        context.outcome = 'proxy-miss-remapped';
+      }
       args[0] = 404;
     } else {
       missingSymbolCache.set(proxyReq.path, false);
+      if (context) {
+        context.outcome = 'proxy';
+      }
     }
     return originalWriteHead.apply(response, args);
   };
@@ -98,16 +152,40 @@ proxy.on('error', (err, req, res) => {
 });
 
 http.createServer((req, res) => {
+  const context: RequestLogContext = {
+    requestId: uuid.v4(),
+    method: req.method || 'GET',
+    originalUrl: req.url || '/',
+  };
+
+  requestContext.set(req, context);
+  res.on('finish', () => {
+    logRequestLifecycle(context, res);
+  });
+
   const parsed = new url.URL(`http://localhost${req.url!}`);
   if (parsed.pathname === '/health') {
+    context.convertedPath = parsed.pathname;
+    context.outcome = 'health';
     return res.writeHead(200).end('Alive');
   }
 
   const cacheKey = incomingPathToProxyPath(parsed.pathname + parsed.search);
+  context.convertedPath = cacheKey;
+
+  console.log('[symbol-server] incoming request', {
+    requestId: context.requestId,
+    method: context.method,
+    originalUrl: context.originalUrl,
+    convertedPath: cacheKey,
+    userAgent: req.headers['user-agent'],
+  });
+
   const userAgent = req.headers['user-agent'];
   const isSentryRequest = userAgent && userAgent.startsWith('symbolicator/');
 
   if (isSentryRequest || req.headers['x-electron-symbol-redirect'] === '1') {
+    context.outcome = 'redirect';
     res.setHeader('Location', url.format({
       protocol: 'https:',
       slashes: true,
@@ -118,11 +196,15 @@ http.createServer((req, res) => {
   }
 
   if (missingSymbolCache.get(cacheKey)) {
+    context.outcome = 'cache-miss';
     return res.writeHead(404).end();
   }
 
+  context.outcome = 'proxy';
   proxy.web(req, res, { target: TARGET_URL });
-}).listen(process.env.PORT || 8080);
+}).listen(process.env.PORT || 8080, () => {
+  logServerStart();
+});
 
 process.on('uncaughtException', (err) => {
   // Avoid process dieing on uncaughtException
