@@ -51,6 +51,7 @@ assert(!shouldSignS3Requests || signingRegion, 'AWS_REGION is defined when S3 re
 type ProxyRequest = http.IncomingMessage & {
   proxyPath?: string;
   cacheKey?: string;
+  proxyMethod?: string;
 };
 
 function incomingPathToProxyPath(path: string): string {
@@ -91,7 +92,7 @@ function incomingPathToProxyPath(path: string): string {
   return `${PATH_PREFIX}${newPath}`;
 }
 
-function signS3ProxyPath(path: string): string {
+function signS3ProxyPath(path: string, method: string): string {
   if (!shouldSignS3Requests) {
     return path;
   }
@@ -99,7 +100,7 @@ function signS3ProxyPath(path: string): string {
   const targetUrl = new url.URL(path, TARGET_URL);
   const signedRequest = aws4.sign({
     host: TARGET_HOST!,
-    method: 'GET',
+    method,
     service: 's3',
     region: signingRegion!,
     signQuery: true,
@@ -117,6 +118,7 @@ proxy.on('proxyReq', (proxyReq, request, response, options) => {
   const req = request as ProxyRequest;
   const proxyPath = req.proxyPath ?? incomingPathToProxyPath(proxyReq.path);
   const cacheKey = req.cacheKey ?? incomingPathToProxyPath(proxyReq.path);
+  const proxyMethod = req.proxyMethod ?? proxyReq.method;
 
   proxyReq.path = proxyPath;
 
@@ -131,12 +133,17 @@ proxy.on('proxyReq', (proxyReq, request, response, options) => {
   // convert 403s to 404s so symsrv.dll doesn't freak out.
   const originalWriteHead = response.writeHead;
   response.writeHead = (...args: [number, any]) => {
-    if (args[0] == 403) {
-      missingSymbolCache.set(cacheKey, true);
+    if (proxyMethod === 'GET') {
+      if (args[0] == 403) {
+        missingSymbolCache.set(cacheKey, true);
+        args[0] = 404;
+      } else {
+        missingSymbolCache.set(cacheKey, false);
+      }
+    } else if (args[0] == 403) {
       args[0] = 404;
-    } else {
-      missingSymbolCache.set(cacheKey, false);
     }
+
     return originalWriteHead.apply(response, args);
   };
 });
@@ -160,12 +167,13 @@ http.createServer((req, res) => {
   }
 
   const cacheKey = incomingPathToProxyPath(parsed.pathname + parsed.search);
+  const requestMethod = (req.method || 'GET').toUpperCase();
   const userAgent = req.headers['user-agent'];
   const isSentryRequest = userAgent && userAgent.startsWith('symbolicator/');
 
   let signedProxyPath: string;
   try {
-    signedProxyPath = signS3ProxyPath(cacheKey);
+    signedProxyPath = signS3ProxyPath(cacheKey, requestMethod);
   } catch (error) {
     const errorId = uuid.v4();
     console.error('Signing Error:', errorId, 'Request:', req.url, error);
@@ -184,6 +192,7 @@ http.createServer((req, res) => {
   const proxyReq = req as ProxyRequest;
   proxyReq.cacheKey = cacheKey;
   proxyReq.proxyPath = signedProxyPath;
+  proxyReq.proxyMethod = requestMethod;
 
   proxy.web(req, res, { target: TARGET_URL });
 }).listen(process.env.PORT || 8080);
